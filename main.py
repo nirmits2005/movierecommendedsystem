@@ -296,10 +296,6 @@ def load_pickles():
     with open(TFIDF_MATRIX_PATH, "rb") as f:
         tfidf_matrix = pickle.load(f)
 
-    # Load tfidf vectorizer (optional, not used directly here)
-    with open(TFIDF_PATH, "rb") as f:
-        tfidf_obj = pickle.load(f)
-
     # Build normalized map
     TITLE_TO_IDX = build_title_to_idx_map(indices_obj)
 
