@@ -3,7 +3,7 @@ import pickle
 from typing import Optional, List, Dict, Any, Tuple
 
 import numpy as np
-import pandas as pd
+import numpy as np
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,16 +44,17 @@ app.add_middleware(
 # =========================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-DF_PATH = os.path.join(BASE_DIR, "df.pkl")
-INDICES_PATH = os.path.join(BASE_DIR, "indices.pkl")
-TFIDF_MATRIX_PATH = os.path.join(BASE_DIR, "tfidf_matrix.pkl")
-TFIDF_PATH = os.path.join(BASE_DIR, "tfidf.pkl")
+NPZ_PATH = os.path.join(BASE_DIR, "movie_data.npz")
+META_PATH = os.path.join(BASE_DIR, "movie_meta.pkl")
 
-df: Optional[pd.DataFrame] = None
-indices_obj: Any = None
-tfidf_matrix: Any = None
-tfidf_obj: Any = None
+csr_data: Any = None
+csr_indices: Any = None
+csr_indptr: Any = None
+csc_data: Any = None
+csc_indices: Any = None
+csc_indptr: Any = None
 
+titles_list: Optional[List[str]] = None
 TITLE_TO_IDX: Optional[Dict[str, int]] = None
 
 
@@ -186,29 +187,8 @@ async def tmdb_search_first(query: str) -> Optional[dict]:
 # TF-IDF Helpers
 # =========================
 def build_title_to_idx_map(indices: Any) -> Dict[str, int]:
-    """
-    indices.pkl can be:
-    - dict(title -> index)
-    - pandas Series (index=title, value=index)
-    We normalize into TITLE_TO_IDX.
-    """
-    title_to_idx: Dict[str, int] = {}
-
-    if isinstance(indices, dict):
-        for k, v in indices.items():
-            title_to_idx[_norm_title(k)] = int(v)
-        return title_to_idx
-
-    # pandas Series or similar mapping
-    try:
-        for k, v in indices.items():
-            title_to_idx[_norm_title(k)] = int(v)
-        return title_to_idx
-    except Exception:
-        # last resort: if it's a list-like etc.
-        raise RuntimeError(
-            "indices.pkl must be dict or pandas Series-like (with .items())"
-        )
+    # No longer needed, as we load a pre-built dictionary from pickle directly.
+    return indices
 
 
 def get_local_idx_by_title(title: str) -> int:
@@ -227,33 +207,45 @@ def tfidf_recommend_titles(
     query_title: str, top_n: int = 10
 ) -> List[Tuple[str, float]]:
     """
-    Returns list of (title, score) from local df using cosine similarity on TF-IDF matrix.
-    Safe against missing columns/rows.
+    Returns list of (title, score) using dot product on purely Numpy arrays.
+    Safe against missing data.
     """
-    global df, tfidf_matrix
-    if df is None or tfidf_matrix is None:
-        raise HTTPException(status_code=500, detail="TF-IDF resources not loaded")
+    global csr_data, csr_indices, csr_indptr
+    global csc_data, csc_indices, csc_indptr
+    global titles_list
+    
+    if csr_indptr is None or titles_list is None:
+        raise HTTPException(status_code=500, detail="Matrix data not loaded")
 
     idx = get_local_idx_by_title(query_title)
 
-    # query vector
-    qv = tfidf_matrix[idx]
-    scores = (tfidf_matrix @ qv.T).toarray().ravel()
-
-    # sort descending
-    order = np.argsort(-scores)
-
+    # Get query vector (non-zero TF-IDF elements)
+    start, end = csr_indptr[idx], csr_indptr[idx+1]
+    qv_indices = csr_indices[start:end]
+    qv_data = csr_data[start:end]
+    
+    num_docs = len(titles_list)
+    scores = np.zeros(num_docs, dtype=np.float32)
+    
+    for i in range(len(qv_indices)):
+        w = qv_indices[i]
+        weight = qv_data[i]
+        
+        c_start, c_end = csc_indptr[w], csc_indptr[w+1]
+        doc_indices = csc_indices[c_start:c_end]
+        doc_weights = csc_data[c_start:c_end]
+        
+        scores[doc_indices] += weight * doc_weights
+        
+    scores[idx] = -1.0 # query's own score
+    
+    limit = min(top_n, len(scores))
+    top_indices = np.argpartition(-scores, limit - 1)[:limit]
+    top_indices = top_indices[np.argsort(-scores[top_indices])]
+    
     out: List[Tuple[str, float]] = []
-    for i in order:
-        if int(i) == int(idx):
-            continue
-        try:
-            title_i = str(df.iloc[int(i)]["title"])
-        except Exception:
-            continue
-        out.append((title_i, float(scores[int(i)])))
-        if len(out) >= top_n:
-            break
+    for i in top_indices:
+        out.append((titles_list[int(i)], float(scores[int(i)])))
     return out
 
 
@@ -282,26 +274,26 @@ async def attach_tmdb_card_by_title(title: str) -> Optional[TMDBMovieCard]:
 # =========================
 @app.on_event("startup")
 def load_pickles():
-    global df, indices_obj, tfidf_matrix, tfidf_obj, TITLE_TO_IDX
+    global csr_data, csr_indices, csr_indptr
+    global csc_data, csc_indices, csc_indptr
+    global titles_list, TITLE_TO_IDX
+    
+    data = np.load(NPZ_PATH)
+    csr_data = data['csr_data']
+    csr_indices = data['csr_indices']
+    csr_indptr = data['csr_indptr']
+    csc_data = data['csc_data']
+    csc_indices = data['csc_indices']
+    csc_indptr = data['csc_indptr']
 
-    # Load df
-    with open(DF_PATH, "rb") as f:
-        df = pickle.load(f)
+    with open(META_PATH, "rb") as f:
+        meta = pickle.load(f)
 
-    # Load indices
-    with open(INDICES_PATH, "rb") as f:
-        indices_obj = pickle.load(f)
+    titles_list = meta['titles']
+    TITLE_TO_IDX = meta['title_to_idx']
 
-    # Load TF-IDF matrix (usually scipy sparse)
-    with open(TFIDF_MATRIX_PATH, "rb") as f:
-        tfidf_matrix = pickle.load(f)
-
-    # Build normalized map
-    TITLE_TO_IDX = build_title_to_idx_map(indices_obj)
-
-    # sanity
-    if df is None or "title" not in df.columns:
-        raise RuntimeError("df.pkl must contain a DataFrame with a 'title' column")
+    if titles_list is None or TITLE_TO_IDX is None:
+        raise RuntimeError("Metadata not valid")
 
 
 # =========================

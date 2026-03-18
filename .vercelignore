@@ -1,0 +1,13 @@
+# Ignore large old pickels and datasets to save size during serverless deployment
+df.pkl
+indices.pkl
+tfidf_matrix.pkl
+tfidf.pkl
+movies_metadata.csv
+movie.ipynb
+convert_to_numpy.py
+
+# Env
+.venv
+__pycache__
+.env
